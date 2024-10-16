@@ -1,0 +1,66 @@
+import json
+import boto3
+import requests
+from botocore.exceptions import ClientError
+
+def get_secret(secret_name):
+    session = boto3.session.Session()
+    client = session.client(service_name='secretsmanager')
+    try:
+        get_secret_value_response = client.get_secret_value(SecretId=secret_name)
+    except ClientError as e:
+        raise e
+    return json.loads(get_secret_value_response['SecretString'])
+
+def get_entra_id_token(tenant_id, client_id, client_secret):
+    token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+    token_data = {
+        'grant_type': 'client_credentials',
+        'client_id': client_id,
+        'client_secret': client_secret,
+        'scope': 'https://management.azure.com/.default'
+    }
+    token_r = requests.post(token_url, data=token_data)
+    token_r.raise_for_status()
+    return token_r.json()['access_token']
+
+def assume_role_with_web_identity(token, role_arn):
+    sts_client = boto3.client('sts')
+    response = sts_client.assume_role_with_web_identity(
+        RoleArn=role_arn,
+        RoleSessionName='LambdaSession',
+        WebIdentityToken=token
+    )
+    return response['Credentials']
+
+def trigger_glue_job(job_name, credentials):
+    glue_client = boto3.client('glue',
+        aws_access_key_id=credentials['AccessKeyId'],
+        aws_secret_access_key=credentials['SecretAccessKey'],
+        aws_session_token=credentials['SessionToken']
+    )
+    response = glue_client.start_job_run(JobName=job_name)
+    return response['JobRunId']
+
+def lambda_handler(event, context):
+    # Get secrets from AWS Secrets Manager
+    secrets = get_secret('EntraIDSecrets')
+    tenant_id = secrets['tenant_id']
+    client_id = secrets['client_id']
+    client_secret = secrets['client_secret']
+    role_arn = secrets['role_arn']
+    
+    # Get Entra ID token
+    token = get_entra_id_token(tenant_id, client_id, client_secret)
+    
+    # Assume AWS role using the Entra ID token
+    credentials = assume_role_with_web_identity(token, role_arn)
+    
+    # Trigger Glue job
+    job_name = event.get('glue_job_name', 'DefaultGlueJobName')
+    job_run_id = trigger_glue_job(job_name, credentials)
+    
+    return {
+        'statusCode': 200,
+        'body': json.dumps(f'Glue job {job_name} triggered successfully. Job run ID: {job_run_id}')
+    }
